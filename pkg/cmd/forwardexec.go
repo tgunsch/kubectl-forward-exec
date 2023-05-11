@@ -20,6 +20,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -29,22 +31,23 @@ import (
 
 var (
 	forwardExecExample = `
-	# Do port forward on port 8080 to pod httpod, execute the curl locally and stop the port-forwards afterward. 
-	%[1]s forward-exec pod/httpod 8080 -- curl http://localhost:8080/api/status/200
-`
-	forwardExecDescription = `
-Simple plugin that is a wrapper around port-forward; i.e. Forward one or more local ports to a pod, run a command on local machine and finally stop the port forward.
-This is useful for doing requests (e.g. via curl) on a pod, which for security reasons don't have a shell included.
+	# Do port forward on port 8080 to pod my-pod, execute the curl locally and stop the port-forwards afterward.  
+	%[1]s forward-exec pod/my-pod 8080 -- curl http://localhost:8080/api
+
+	# Same, but with timeout 10 seconds.  
+	%[1]s forward-exec -t 10 pod/my-pod 8080 -- curl http://localhost:8080/api
+
+	# Do a port forward from local port 8080 to port 80 of service my-service in namespace my-namespace and context prod. 
+	%[1]s forward-exec --context prod -n my-namespace svc/my-service 8080:80 -- curl http://localhost:8080/api/status/200
+
 `
 )
 
-// NamespaceOptions provides information required to update
-// the current context on a user's KUBECONFIG
-type NamespaceOptions struct {
+type ForwardExecOptions struct {
 	configFlags *genericclioptions.ConfigFlags
 
-	//resultingContext     *api.Context
-	//resultingContextName string
+	timeoutSeconds int
+	debug          bool
 
 	userSpecifiedCluster   string
 	userSpecifiedContext   string
@@ -75,23 +78,21 @@ type PortForward struct {
 	ReadyCh    chan struct{}
 }
 
-// NewDefaultOptions provides an instance of NamespaceOptions with default values
-func NewDefaultOptions(streams genericiooptions.IOStreams) *NamespaceOptions {
-	return &NamespaceOptions{
+// NewDefaultOptions provides an instance of ForwardExecOptions with default values
+func NewDefaultOptions(streams genericiooptions.IOStreams) *ForwardExecOptions {
+	return &ForwardExecOptions{
 		configFlags: genericclioptions.NewConfigFlags(true),
-
-		IOStreams: streams,
+		IOStreams:   streams,
 	}
 }
 
-// NewForwardExecCmd provides a cobra command wrapping NamespaceOptions
+// NewForwardExecCmd provides a cobra command wrapping ForwardExecOptions
 func NewForwardExecCmd(streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewDefaultOptions(streams)
 
 	cmd := &cobra.Command{
-		Use:          "forward-exec TYPE/NAME [LOCAL_PORT:]REMOTE_PORT -- COMMAND",
-		Short:        "Forward one or more local ports to a pod, run a command on local machine and finally stop the port forward.",
-		Long:         forwardExecDescription,
+		Use:          "forward-exec [OPTIONS] TYPE/NAME [LOCAL_PORT:]REMOTE_PORT -- COMMAND",
+		Short:        "Forward one local ports to a pod, run a command on local machine and stop the port forward afterwards.",
 		Example:      fmt.Sprintf(forwardExecExample, "kubectl"),
 		SilenceUsage: true,
 		RunE: func(c *cobra.Command, args []string) error {
@@ -109,14 +110,15 @@ func NewForwardExecCmd(streams genericiooptions.IOStreams) *cobra.Command {
 		},
 	}
 
-	//cmd.Flags().BoolVar(&o.listNamespaces, "list", o.listNamespaces, "if true, print the list of all namespaces in the current KUBECONFIG")
+	cmd.Flags().BoolVarP(&o.debug, "debug", "d", false, "Output some diagnostic messages. By default, only the output of the command will be written to stdout.")
+	cmd.Flags().IntVarP(&o.timeoutSeconds, "timeout", "t", 0, "The timeout for the command in seconds. By default, the command will execute until finished.")
 	o.configFlags.AddFlags(cmd.Flags())
 
 	return cmd
 }
 
 // Complete sets all information required for updating the current context
-func (o *NamespaceOptions) Complete(cmd *cobra.Command, args []string) error {
+func (o *ForwardExecOptions) Complete(cmd *cobra.Command, args []string) error {
 
 	var err error
 	o.config = o.configFlags.ToRawKubeConfigLoader()
@@ -188,7 +190,7 @@ func (o *NamespaceOptions) Complete(cmd *cobra.Command, args []string) error {
 }
 
 // Validate ensures that all required arguments and flag values are provided
-func (o *NamespaceOptions) Validate() error {
+func (o *ForwardExecOptions) Validate() error {
 	if o.objectType != "svc" && o.objectType != "pod" {
 		return fmt.Errorf("invalid objectType %s", o.objectType)
 	}
@@ -203,7 +205,7 @@ func (o *NamespaceOptions) Validate() error {
 
 // Run lists all available namespaces on a user's KUBECONFIG or updates the
 // current context based on a provided namespace.
-func (o *NamespaceOptions) Run() (err error) {
+func (o *ForwardExecOptions) Run() (err error) {
 
 	var (
 		pf      *PortForward
@@ -216,9 +218,14 @@ func (o *NamespaceOptions) Run() (err error) {
 		// Out:    os.Stdout,
 		ErrOut: os.Stderr,
 	}
+
 	pf, err = NewPortForward(o, streams)
 
+	// Execute port forward in go func
 	go func() {
+		if o.debug {
+			fmt.Printf("Do port-forward for pod %s in namespace %s for port %d:%d\n", pf.PodName, pf.Namespace, pf.LocalPort, pf.RemotePort)
+		}
 		err = pf.PortForward(o.restClientConfig)
 		if err != nil {
 			fmt.Println(err)
@@ -228,21 +235,71 @@ func (o *NamespaceOptions) Run() (err error) {
 	}()
 
 	defer close(pf.StopCh)
+
+	// Wait until connection established
 	select {
 	case <-pf.ReadyCh:
 		break
 	}
-	fmt.Printf("Port forwarding is ready to get traffic. Start command %s with args %v\n", o.command, o.commandArgs)
-	cmd := exec.Command(o.command, o.commandArgs...)
-	if out, err = cmd.Output(); err != nil {
+	if o.debug {
+		fmt.Printf("Port forwarding is ready to get traffic. Start command %s with args %v\n", o.command, o.commandArgs)
+	}
+
+	out, err = o.StartCommand()
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
-	fmt.Printf("%s\n", out)
+	fmt.Printf("%s", out)
 	return
 
 }
 
-func NewPortForward(o *NamespaceOptions, streams genericiooptions.IOStreams) (pf *PortForward, err error) {
+func (o *ForwardExecOptions) StartCommand() ([]byte, error) {
+	type cmdResult struct {
+		out []byte
+		err error
+	}
+	var (
+		cmd       *exec.Cmd
+		readyCh   chan cmdResult
+		startTime time.Time
+	)
+	cmd = exec.Command(o.command, o.commandArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	readyCh = make(chan cmdResult, 1)
+	startTime = time.Now()
+	go func() {
+		out, err := cmd.CombinedOutput()
+		readyCh <- cmdResult{out, err}
+	}()
+
+	if o.timeoutSeconds > 0 {
+		select {
+		case <-time.After(time.Duration(o.timeoutSeconds) * time.Second):
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			return nil, fmt.Errorf("command timedout after %d seconds", o.timeoutSeconds)
+		case result := <-readyCh:
+			if o.debug {
+				fmt.Printf("command finished after %s", time.Now().Sub(startTime))
+			}
+			return result.out, nil
+		}
+	} else {
+		select {
+		case result := <-readyCh:
+			if o.debug {
+				fmt.Printf("command finished after %s", time.Now().Sub(startTime))
+			}
+			return result.out, nil
+		}
+
+	}
+
+}
+
+func NewPortForward(o *ForwardExecOptions, streams genericiooptions.IOStreams) (pf *PortForward, err error) {
 	var (
 		svc           *v1.Service
 		pods          *v1.PodList
@@ -275,8 +332,6 @@ func NewPortForward(o *NamespaceOptions, streams genericiooptions.IOStreams) (pf
 		svc, err = clientset.CoreV1().Services(pf.Namespace).Get(context.TODO(), o.objectName, metav1.GetOptions{})
 		if err != nil {
 			fmt.Println(err)
-			//close(r)
-			//servicesNotFound = append(servicesNotFound, srv)
 			return nil, err
 		}
 
@@ -329,7 +384,6 @@ func (pf *PortForward) PortForward(restClientConfig *rest.Config) error {
 		upgrader  spdy.Upgrader
 	)
 
-	fmt.Printf("Do port-forward for pod %s in namespace %s for port %d:%d\n", pf.PodName, pf.Namespace, pf.LocalPort, pf.RemotePort)
 	path = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", pf.Namespace, pf.PodName)
 	hostIP = strings.TrimLeft(restClientConfig.Host, "htps:/")
 
@@ -347,7 +401,7 @@ func (pf *PortForward) PortForward(restClientConfig *rest.Config) error {
 	return fw.ForwardPorts()
 }
 
-func (o *NamespaceOptions) Namespace() (string, error) {
+func (o *ForwardExecOptions) Namespace() (string, error) {
 	namespace, _, err := o.config.Namespace()
 	if err != nil {
 		return "", err
@@ -355,6 +409,6 @@ func (o *NamespaceOptions) Namespace() (string, error) {
 	return namespace, nil
 }
 
-func (o *NamespaceOptions) CurrentContext() string {
+func (o *ForwardExecOptions) CurrentContext() string {
 	return o.rawConfig.CurrentContext
 }

@@ -1,0 +1,34 @@
+project_name: kubectl-forward-exec
+
+env:
+  - GO111MODULE=on
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: kubectl-forward-exec
+    main: cmd/kubectl-forward-exec.go
+    binary: kubectl-forward-exec
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - builds:
+      - kubectl-forward-exec
+    name_template: "{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    wrap_in_directory: false
+    format: tar.gz
+    rlcp: true
+    files:
+      - LICENSE
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Tag }}_SHA256SUMS'
+  algorithm: sha256
